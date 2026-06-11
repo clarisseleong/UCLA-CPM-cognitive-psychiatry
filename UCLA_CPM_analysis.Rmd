@@ -1,0 +1,497 @@
+---
+title: "Connectome-Based Predictive Modelling of Cognitive Performance"
+subtitle: "Transdiagnostic Analysis: Schizophrenia, Bipolar, ADHD & Controls"
+author: "Clarisse Leong"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width  = 12,
+  fig.height = 8,
+  dpi     = 300
+)
+```
+
+# 1. Load Packages
+
+```{r packages}
+packages <- c("tidyverse", "ggplot2", "corrplot", "RColorBrewer",
+              "viridis", "igraph", "reshape2", "patchwork",
+              "ggraph", "tidygraph", "scales", "psych")
+
+for (pkg in packages) {
+  if (!require(pkg, character.only = TRUE, quietly = TRUE)) {
+    install.packages(pkg)
+    library(pkg, character.only = TRUE)
+  }
+}
+```
+
+# 2. Load Data
+
+```{r load-data}
+fc_mat <- readRDS("/Users/clarisseleong/Desktop/UCLA_restFC.rds")
+sc_mat <- readRDS("/Users/clarisseleong/Desktop/UCLA_SC.rds")
+beh    <- read.csv("/Users/clarisseleong/Desktop/UCLA_behdata_cleaned.csv")
+
+cat("FC dimensions:", dim(fc_mat), "\n")
+cat("Beh rows:", nrow(beh), "\n")
+cat("Diagnosis breakdown:\n")
+print(table(beh$diagnosis))
+```
+
+# 3. Reconstruct FC Matrices
+
+```{r reconstruct-fc}
+n_regions <- 174
+
+# Function to reconstruct symmetric matrix from upper triangle vector
+vec_to_mat <- function(vec, n) {
+  mat <- matrix(0, n, n)
+  mat[upper.tri(mat)] <- vec
+  mat <- mat + t(mat)
+  diag(mat) <- 1
+  return(mat)
+}
+
+# Store as 3D array: participants x regions x regions
+n_sub_fc <- nrow(fc_mat)
+FC_3d    <- array(0, dim = c(n_sub_fc, n_regions, n_regions))
+
+for (i in 1:n_sub_fc) {
+  FC_3d[i,,] <- vec_to_mat(fc_mat[i,], n_regions)
+}
+
+cat("FC array dimensions:", dim(FC_3d), "\n")
+```
+
+# 4. Match Participants to Behaviour
+
+```{r match-participants}
+beh_fc    <- beh[!is.na(beh$restFC), ]
+n_matched <- min(nrow(beh_fc), n_sub_fc)
+beh_fc    <- beh_fc[1:n_matched, ]
+FC_use    <- FC_3d[1:n_matched,,]
+
+cat("Matched N =", n_matched, "\n")
+cat("Diagnosis breakdown (matched):\n")
+print(table(beh_fc$diagnosis))
+```
+
+# 5. Define Cognitive Targets
+
+```{r cognitive-targets}
+cog_vars <- list(
+  working_memory   = "wais_lns_totalraw",
+  attention        = "cpt_fa",
+  verbal_memory    = "cvlt_totcor",
+  processing_speed = "colortrails_crt_time1",
+  inhibition       = "stopsigl_sst_ses_ssrt"
+)
+
+# Check availability
+for (nm in names(cog_vars)) {
+  var <- cog_vars[[nm]]
+  if (var %in% colnames(beh_fc)) {
+    n_avail <- sum(!is.na(beh_fc[[var]]))
+    cat(nm, "(", var, "):", n_avail, "available\n")
+  } else {
+    cat(nm, "(", var, "): NOT FOUND\n")
+  }
+}
+```
+
+# 6. Connectome-Based Predictive Modelling (CPM)
+
+```{r}
+# Residualise cognitive scores against age, sex
+residualise_cog <- function(beh_df, var_name) {
+  formula <- as.formula(paste(var_name, "~ age + gender"))
+  fit <- lm(formula, data = beh_df, na.action = na.exclude)
+  residuals(fit)
+}
+
+for (nm in names(cog_vars)) {
+  var <- cog_vars[[nm]]
+  if (var %in% colnames(beh_fc)) {
+    beh_fc[[paste0(var, "_resid")]] <- residualise_cog(beh_fc, var)
+    cog_vars[[nm]] <- paste0(var, "_resid")  # point CPM to residuals
+  }
+}
+```
+
+```{r cpm-function}
+run_cpm <- function(FC_array, behavior, thresh = 0.01) {
+  n     <- length(behavior)
+  n_reg <- dim(FC_array)[2]
+  pred  <- numeric(n)
+
+  for (i in 1:n) {
+    # Split train/test
+    train_fc  <- FC_array[-i,,]
+    train_beh <- behavior[-i]
+    test_fc   <- FC_array[i,,]
+
+    # Remove NAs from training
+    valid     <- !is.na(train_beh)
+    train_fc  <- train_fc[valid,,]
+    train_beh <- train_beh[valid]
+
+    # Correlate each edge with behavior in training set
+    edge_r <- matrix(0, n_reg, n_reg)
+    edge_p <- matrix(1, n_reg, n_reg)
+
+    for (r1 in 1:(n_reg - 1)) {
+      for (r2 in (r1 + 1):n_reg) {
+        edge_vals <- train_fc[, r1, r2]
+        if (sd(edge_vals, na.rm = TRUE) > 0) {
+          ct <- cor.test(edge_vals, train_beh, method = "pearson")
+          edge_r[r1, r2] <- ct$estimate
+          edge_p[r1, r2] <- ct$p.value
+        }
+      }
+    }
+
+    # Select positive and negative edges
+    pos_mask <- (edge_p < thresh) & (edge_r > 0)
+    neg_mask <- (edge_p < thresh) & (edge_r < 0)
+
+    # Build summary scores for test subject
+    pos_sum <- sum(test_fc[pos_mask], na.rm = TRUE)
+    neg_sum <- sum(test_fc[neg_mask], na.rm = TRUE)
+
+    # Fit linear model on training data
+    pos_train <- apply(train_fc, 1, function(m) sum(m[pos_mask], na.rm = TRUE))
+    neg_train <- apply(train_fc, 1, function(m) sum(m[neg_mask], na.rm = TRUE))
+
+    if (sum(pos_mask) > 0 & sum(neg_mask) > 0) {
+      train_df <- data.frame(beh = train_beh, pos = pos_train, neg = neg_train)
+      fit      <- lm(beh ~ pos + neg, data = train_df)
+      pred[i]  <- predict(fit, newdata = data.frame(pos = pos_sum, neg = neg_sum))
+    } else if (sum(pos_mask) > 0) {
+      train_df <- data.frame(beh = train_beh, pos = pos_train)
+      fit      <- lm(beh ~ pos, data = train_df)
+      pred[i]  <- predict(fit, newdata = data.frame(pos = pos_sum))
+    } else {
+      pred[i]  <- mean(train_beh, na.rm = TRUE)
+    }
+
+    if (i %% 20 == 0) cat("  LOO iteration", i, "/", n, "\n")
+  }
+
+  # Compute performance
+  valid_idx <- !is.na(behavior)
+  r_val     <- cor(pred[valid_idx], behavior[valid_idx], use = "complete.obs")
+  p_val     <- cor.test(pred[valid_idx], behavior[valid_idx])$p.value
+
+  return(list(predicted = pred, observed = behavior,
+              r = r_val, p = p_val))
+}
+```
+
+```{r run-cpm}
+cat("Running CPM (LOO cross-validation) — this may take 10-15 mins...\n\n")
+
+cpm_results <- list()
+
+for (nm in names(cog_vars)) {
+  var <- cog_vars[[nm]]
+  if (!var %in% colnames(beh_fc)) next
+
+  beh_vec <- as.numeric(beh_fc[[var]])
+  n_valid <- sum(!is.na(beh_vec))
+
+  if (n_valid < 30) {
+    cat("Skipping", nm, "- too few observations (", n_valid, ")\n")
+    next
+  }
+
+  cat("Running CPM for:", nm, "(N =", n_valid, ")\n")
+  result <- run_cpm(FC_use, beh_vec, thresh = 0.01)
+  cpm_results[[nm]] <- result
+  cat("  r =", round(result$r, 3), "  p =", round(result$p, 4), "\n\n")
+}
+```
+```
+```{r permutation-note}
+# Permutation testing was attempted but was computationally prohibitive
+# given the LOO design and sample size (N = 247).
+# Conventional p-values from Pearson correlation are reported instead.
+# This is noted as a limitation of the current analysis.
+cat("Note: Permutation testing not run due to computational constraints.\n")
+cat("Significance assessed via Pearson correlation p-values.\n")
+```
+
+# 7. Visualisation: CPM Scatter Plots
+
+```{r cpm-scatter, fig.width=14, fig.height=10}
+diag_colors <- c("CONTROL" = "#2196F3",
+                 "SCHZ"    = "#F44336",
+                 "BIPOLAR" = "#FF9800",
+                 "ADHD"    = "#4CAF50")
+
+plot_list <- list()
+
+for (nm in names(cpm_results)) {
+  res <- cpm_results[[nm]]
+  df  <- data.frame(
+    observed  = res$observed,
+    predicted = res$predicted,
+    diagnosis = beh_fc$diagnosis
+  ) %>% filter(!is.na(observed))
+
+  p <- ggplot(df, aes(x = observed, y = predicted, color = diagnosis)) +
+    geom_point(alpha = 0.7, size = 2.5) +
+    geom_smooth(method = "lm", color = "black", se = TRUE, linewidth = 1) +
+    scale_color_manual(values = diag_colors) +
+    theme_minimal(base_size = 12) +
+    labs(
+      title    = paste0("CPM: ", nm),
+      subtitle = paste0("r = ", round(res$r, 3),
+                        ", p = ", format.pval(res$p, digits = 3)),
+      x        = "Observed Score",
+      y        = "Predicted Score",
+      color    = "Diagnosis"
+    ) +
+    theme(
+      plot.title      = element_text(face = "bold", size = 13),
+      plot.subtitle   = element_text(color = "gray40", size = 10),
+      legend.position = "bottom"
+    )
+
+  plot_list[[nm]] <- p
+}
+
+if (length(plot_list) >= 2) {
+  wrap_plots(plot_list, ncol = 2) +
+    plot_annotation(
+      title    = "Connectome-Based Prediction of Cognitive Performance",
+      subtitle = "Resting-state FC → Cognitive scores | Leave-one-out cross-validation",
+      theme    = theme(
+        plot.title    = element_text(size = 16, face = "bold", hjust = 0.5),
+        plot.subtitle = element_text(size = 11, hjust = 0.5, color = "gray40")
+      )
+    )
+}
+```
+
+# 8. Visualisation: Group FC Matrices
+
+```{r fc-matrices, fig.width=14, fig.height=12}
+diagnoses   <- c("CONTROL", "SCHZ", "BIPOLAR", "ADHD")
+diag_labels <- c("Healthy Controls", "Schizophrenia", "Bipolar", "ADHD")
+
+n_show   <- 50
+show_idx <- round(seq(1, n_regions, length.out = n_show))
+
+fc_plots <- list()
+
+for (d in diagnoses) {
+  idx     <- which(beh_fc$diagnosis == d)
+  mean_fc <- apply(FC_use[idx, show_idx, show_idx], c(2, 3), mean, na.rm = TRUE)
+
+  df_melt <- melt(mean_fc)
+  colnames(df_melt) <- c("Region1", "Region2", "FC")
+
+  p <- ggplot(df_melt, aes(x = Region1, y = Region2, fill = FC)) +
+    geom_tile() +
+    scale_fill_gradientn(
+      colors = c("#053061", "#2166AC", "#4393C3", "#92C5DE",
+                 "#F7F7F7", "#FDDBC7", "#F4A582", "#D6604D", "#B2182B"),
+      limits = c(-0.5, 0.5), oob = scales::squish,
+      name   = "FC (r)"
+    ) +
+    theme_minimal(base_size = 10) +
+    theme(
+      axis.text       = element_blank(),
+      axis.ticks      = element_blank(),
+      panel.grid      = element_blank(),
+      plot.title      = element_text(face = "bold", size = 12, hjust = 0.5),
+      legend.position = "right"
+    ) +
+    labs(
+      title = diag_labels[which(diagnoses == d)],
+      x = "Brain Region", y = "Brain Region"
+    ) +
+    coord_fixed()
+
+  fc_plots[[d]] <- p
+}
+
+wrap_plots(fc_plots, ncol = 2) +
+  plot_annotation(
+    title    = "Mean Resting-State Functional Connectivity by Diagnosis",
+    subtitle = "Top 50 regions shown | Warmer = stronger positive FC",
+    theme    = theme(
+      plot.title    = element_text(size = 16, face = "bold", hjust = 0.5),
+      plot.subtitle = element_text(size = 11, hjust = 0.5, color = "gray40")
+    )
+  )
+```
+
+# 9. Graph Theory Metrics
+
+```{r graph-metrics-compute}
+compute_graph_metrics <- function(fc_vec, n_reg, threshold = 0.2) {
+  mat <- vec_to_mat(fc_vec, n_reg)
+  mat[mat < threshold] <- 0
+  diag(mat) <- 0
+  g <- graph_from_adjacency_matrix(mat, mode = "undirected", weighted = TRUE)
+
+  list(
+    strength   = mean(strength(g), na.rm = TRUE),
+    clustering = transitivity(g, type = "average"),
+    efficiency = 1 / mean_distance(g, directed = FALSE, unconnected = TRUE),
+    modularity = modularity(cluster_louvain(g))
+  )
+}
+
+cat("Computing graph metrics for each participant...\n")
+metrics_df <- data.frame()
+
+for (i in 1:n_matched) {
+  if (i %% 30 == 0) cat("  Participant", i, "/", n_matched, "\n")
+  m <- tryCatch(
+    compute_graph_metrics(fc_mat[i,], n_regions),
+    error = function(e) list(strength = NA, clustering = NA,
+                             efficiency = NA, modularity = NA)
+  )
+  metrics_df <- rbind(metrics_df, data.frame(
+    participant = i,
+    diagnosis   = beh_fc$diagnosis[i],
+    age         = beh_fc$age[i],
+    gender      = beh_fc$gender[i],
+    strength    = m$strength,
+    clustering  = m$clustering,
+    efficiency  = m$efficiency,
+    modularity  = m$modularity
+  ))
+}
+```
+
+```{r graph-metrics-plot, fig.width=12, fig.height=10}
+metrics_long <- metrics_df %>%
+  select(diagnosis, strength, clustering, efficiency, modularity) %>%
+  pivot_longer(-diagnosis, names_to = "metric", values_to = "value") %>%
+  filter(!is.na(value))
+
+ggplot(metrics_long, aes(x = diagnosis, y = value, fill = diagnosis)) +
+  geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+  geom_jitter(width = 0.2, alpha = 0.3, size = 1, aes(color = diagnosis)) +
+  facet_wrap(~metric, scales = "free_y", ncol = 2,
+             labeller = labeller(metric = c(
+               strength   = "Node Strength",
+               clustering = "Clustering Coefficient",
+               efficiency = "Global Efficiency",
+               modularity = "Modularity"
+             ))) +
+  scale_fill_manual(values  = diag_colors) +
+  scale_color_manual(values = diag_colors) +
+  theme_minimal(base_size = 12) +
+  theme(
+    strip.text      = element_text(face = "bold", size = 12),
+    axis.text.x     = element_text(angle = 30, hjust = 1, size = 10),
+    legend.position = "none",
+    plot.title      = element_text(face = "bold", size = 16, hjust = 0.5),
+    plot.subtitle   = element_text(size = 11, hjust = 0.5, color = "gray40")
+  ) +
+  labs(
+    title    = "Graph Theory Metrics by Diagnosis",
+    subtitle = "Resting-state functional connectome | Threshold = 0.2",
+    x        = NULL,
+    y        = "Value"
+  )
+```
+
+# 10. Statistical Tests
+
+```{r stats}
+for (met in c("strength", "clustering", "efficiency", "modularity")) {
+  cat("\n---", met, "---\n")
+  formula <- as.formula(paste(met, "~ diagnosis"))
+  aov_res <- aov(formula, data = metrics_df)
+  print(summary(aov_res))
+
+  if (summary(aov_res)[[1]]$`Pr(>F)`[1] < 0.05) {
+    cat("Post-hoc (Tukey):\n")
+    print(TukeyHSD(aov_res))
+  }
+}
+```
+
+# 11. Visualisation: CPM Summary
+
+```{r cpm-summary, fig.width=10, fig.height=6}
+if (length(cpm_results) > 0) {
+  cpm_summary <- data.frame(
+    domain = names(cpm_results),
+    r      = sapply(cpm_results, function(x) x$r),
+    p      = sapply(cpm_results, function(x) x$p)
+  ) %>%
+    mutate(
+      significant  = p < 0.05,
+      domain_label = c(
+        working_memory   = "Working Memory",
+        attention        = "Attention",
+        verbal_memory    = "Verbal Memory",
+        processing_speed = "Processing Speed",
+        inhibition       = "Inhibitory Control"
+      )[domain]
+    )
+
+  ggplot(cpm_summary,
+         aes(x = reorder(domain_label, r), y = r, fill = significant)) +
+    geom_col(width = 0.6, alpha = 0.85) +
+    geom_text(aes(label = ifelse(significant, "*", ""),
+                  y = r + 0.01), size = 6, vjust = 0) +
+    geom_hline(yintercept = 0, linewidth = 0.5) +
+    scale_fill_manual(
+      values = c("TRUE" = "#1565C0", "FALSE" = "#90A4AE"),
+      labels = c("TRUE" = "p < .05", "FALSE" = "p ≥ .05"),
+      name   = "Significance"
+    ) +
+    coord_flip() +
+    theme_minimal(base_size = 13) +
+    labs(
+      title    = "CPM Prediction Accuracy Across Cognitive Domains",
+      subtitle = "Pearson r between predicted and observed scores | * = p < .05",
+      x        = NULL,
+      y        = "Prediction Accuracy (r)"
+    ) +
+    theme(
+      plot.title      = element_text(face = "bold", size = 15, hjust = 0.5),
+      plot.subtitle   = element_text(size = 10, hjust = 0.5, color = "gray40"),
+      legend.position = "bottom"
+    )
+}
+```
+
+# 12. Save Results
+
+```{r save}
+saveRDS(cpm_results, "CPM_results.rds")
+write.csv(metrics_df, "graph_metrics_per_participant.csv", row.names = FALSE)
+
+if (length(cpm_results) > 0) {
+  cpm_summary_out <- data.frame(
+    domain = names(cpm_results),
+    r      = sapply(cpm_results, function(x) round(x$r, 4)),
+    p      = sapply(cpm_results, function(x) round(x$p, 4))
+  )
+  write.csv(cpm_summary_out, "CPM_summary.csv", row.names = FALSE)
+}
+
+cat("All done! Output files saved to working directory.\n")
+```
