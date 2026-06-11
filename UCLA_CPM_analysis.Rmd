@@ -224,7 +224,7 @@ for (nm in names(cog_vars)) {
   cat("  r =", round(result$r, 3), "  p =", round(result$p, 4), "\n\n")
 }
 ```
-```
+
 ```{r permutation-note}
 # Permutation testing was attempted but was computationally prohibitive
 # given the LOO design and sample size (N = 247).
