@@ -49,5 +49,12 @@ R packages: tidyverse, ggplot2, corrplot, RColorBrewer, viridis, igraph, reshape
 
 ## References
 
-Poldrack et al. (2016). A phenome-wide examination of neural and cognitive function. *Scientific Data*.  
-Shen et al. (2017). Using connectome-based predictive modeling to predict individual behavior from brain connectivity. *Nature Protocols*.
+- Abi-Dargham et al. (2023). Candidate biomarkers in psychiatric disorders: state of the field. *World Psychiatry*. https://doi.org/10.1002/wps.21078
+- Arias et al. (2022). Quantifying the Global Burden of Mental Disorders and Their Economic Value. *EClinicalMedicine*. https://doi.org/10.1016/j.eclinm.2022.101675
+- Barron et al. (2020). Transdiagnostic, Connectome-Based Prediction of Memory Constructs Across Psychiatric Disorders. *Cerebral Cortex*. https://doi.org/10.1093/cercor/bhaa371
+- Esteban et al. (2019). fMRIPrep: a robust preprocessing pipeline for functional MRI. *Nature Methods*. https://doi.org/10.1038/s41592-018-0235-4
+- Finn et al. (2015). Functional connectome fingerprinting: identifying individuals using patterns of brain connectivity. *Nature Neuroscience*. https://doi.org/10.1038/nn.4135
+- Lv et al. (2025). Transdiagnostic Connectome-Based Prediction of Response Inhibition. *Human Brain Mapping*. https://doi.org/10.1002/hbm.70158
+- Poldrack et al. (2016). A phenome-wide examination of neural and cognitive function. *Scientific Data*. https://doi.org/10.1038/sdata.2016.110
+- Shen et al. (2017). Using connectome-based predictive modeling to predict individual behavior from brain connectivity. *Nature Protocols*. https://doi.org/10.1038/nprot.2016.178
+- Zhu et al. (2021). Dynamic functional connectome predicts individual working memory performance across diagnostic categories. *NeuroImage: Clinical*. https://doi.org/10.1016/j.nicl.2021.102593
