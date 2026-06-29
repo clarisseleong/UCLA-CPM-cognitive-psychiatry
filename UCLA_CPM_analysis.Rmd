@@ -1,0 +1,499 @@
+---
+title: "Connectome-Based Predictive Modelling of Cognitive Performance in Psychiatric Disorders"
+author: "Leong Rui Ying Clarisse | NTU Singapore | HP4210 BrainHack School 2026"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.align = "center")
+```
+
+---
+
+# 1. Background & Motivation
+
+This project investigates whether resting-state functional connectivity (rsFC) can **transdiagnostically** predict individual cognitive performance across schizophrenia (SZ), bipolar disorder (BD), ADHD, and healthy controls using **Connectome-Based Predictive Modelling (CPM)** (Shen et al., 2017).
+
+Schizophrenia, bipolar disorder, and ADHD share overlapping cognitive impairment profiles — including deficits in working memory, verbal memory, attention, processing speed, and inhibitory control — yet differ in severity rather than which domains are affected (Vöhringer et al., 2013). If these shared deficits arise from common alterations in functional brain organisation, a single rsFC-based model should predict cognitive performance across diagnostic boundaries. This is the **transdiagnostic hypothesis** tested here.
+
+**Data sources:**
+
+- **Resting-state fMRI timeseries**: Bryant et al. (2023), publicly available on Zenodo (DOI: 10.5281/zenodo.10431855). Preprocessed rsfMRI timeseries from the UCLA Consortium for Neuropsychiatric Phenomics (CNP) LA5c Study (ds000030), using fMRIPrep v1.1.1 with ICA-AROMA (non-aggressive) + 2P + global mean regression denoising. Timeseries extracted from 82 brain regions: 68 cortical (Desikan-Killiany atlas) + 14 subcortical, 152 timepoints per subject.
+
+- **Behavioural and demographic data**: Publicly available on OpenNeuro (ds000030; Poldrack et al., 2016; DOI: 10.18112/openneuro.ds000030.v1.0.0).
+
+---
+
+# 2. Setup
+
+```{r libraries}
+library(tidyverse)
+library(R.matlab)
+library(corrplot)
+library(ggplot2)
+library(patchwork)
+library(RColorBrewer)
+library(scales)
+library(psych)
+```
+
+---
+
+# 3. Load & Prepare Data
+
+## 3.1 Load rsfMRI Timeseries
+
+The Zenodo `.mat` file stores all subjects' timeseries in a flat matrix. Each subject contributes 82 rows (one per brain region) × 152 columns (timepoints). We identify unique subjects and regions, then reshape into a per-subject list.
+
+```{r load-timeseries}
+mat_data  <- readMat("data/UCLA_CNP_fMRI_TS.mat")
+ts_struct <- mat_data$feather.to.mat.struct
+
+subject_ids    <- ts_struct[[1]][, 1]
+brain_regions  <- trimws(ts_struct[[2]][, 1])
+timeseries_mat <- ts_struct[[3]]
+
+unique_subjects <- unique(subject_ids)
+unique_regions  <- unique(brain_regions)
+
+cat("Total rows:",            length(subject_ids),    "\n")
+cat("Unique subjects:",       length(unique_subjects), "\n")
+cat("Unique brain regions:",  length(unique_regions),  "\n")
+cat("Timepoints per region:", ncol(timeseries_mat),    "\n")
+```
+
+## 3.2 Build Per-Subject Timeseries Arrays
+
+Each subject's rows are extracted and stored as a **regions × timepoints** matrix.
+
+```{r reshape-timeseries}
+n_subjects   <- length(unique_subjects)
+n_regions    <- length(unique_regions)
+n_timepoints <- ncol(timeseries_mat)
+
+ts_list <- vector("list", n_subjects)
+names(ts_list) <- unique_subjects
+
+for (i in seq_along(unique_subjects)) {
+  subj <- unique_subjects[i]
+  idx  <- which(subject_ids == subj)
+  ts_list[[subj]] <- timeseries_mat[idx, ]  # regions × timepoints
+}
+
+cat("Timeseries list built for", length(ts_list), "subjects\n")
+cat("Each subject matrix:", nrow(ts_list[[1]]), "regions ×",
+    ncol(ts_list[[1]]), "timepoints\n")
+```
+
+## 3.3 Compute Functional Connectivity Matrices
+
+For each subject, **Pearson correlation** is computed between every pair of regional timeseries to produce an 82×82 FC matrix. The **Fisher-Z transform** (`atanh`) is then applied to normalise the distribution of r-values — raw Pearson r is bounded [−1, 1] with a skewed sampling distribution, whereas Fisher-Z is approximately normally distributed, as required by the linear models in CPM. The diagonal is set to 0. The upper triangle (3,321 unique edges) is flattened into a feature vector per subject.
+
+```{r compute-fc}
+compute_fc <- function(ts_matrix) {
+  fc   <- cor(t(ts_matrix), method = "pearson")
+  fc_z <- atanh(fc)  # Fisher-Z transform
+  diag(fc_z) <- 0
+  return(fc_z)
+}
+
+fc_list <- lapply(ts_list, compute_fc)
+
+# Flatten upper triangle → feature vector per subject
+n_edges   <- n_regions * (n_regions - 1) / 2
+upper_idx <- which(upper.tri(matrix(0, n_regions, n_regions)))
+
+fc_matrix <- matrix(NA, nrow = n_subjects, ncol = n_edges)
+rownames(fc_matrix) <- unique_subjects
+
+for (i in seq_along(unique_subjects)) {
+  subj <- unique_subjects[i]
+  fc_matrix[i, ] <- fc_list[[subj]][upper_idx]
+}
+
+cat("FC matrix:", nrow(fc_matrix), "subjects ×", ncol(fc_matrix), "edges\n")
+```
+
+## 3.4 Load Behavioural Data
+
+Five cognitive domains are assessed using validated neuropsychological tasks:
+
+| Domain | Task | Variable | Scoring direction |
+|---|---|---|---|
+| Working memory | WAIS Letter-Number Sequencing | `lns_totalraw` | Higher = better |
+| Attention | CPT False Alarms | `cpt_fa` | **Lower = better** (fewer errors) |
+| Verbal memory | CVLT Total Correct | `cvlt_totcor` | Higher = better |
+| Processing speed | Color Trails Time 1 | `crt_time1` | **Lower = better** (faster) |
+| Inhibitory control | SSRT | `sst_ses_ssrt` | **Lower = better** (faster stop) |
+
+Note that attention, processing speed, and inhibitory control are error or latency measures — higher values indicate worse performance. This is important for interpreting the sign of CPM prediction accuracy.
+
+```{r load-behaviour}
+participants <- read_tsv("data/phenotype/participants.tsv",  show_col_types = FALSE)
+wais         <- read_tsv("data/phenotype/wais.tsv",         show_col_types = FALSE)
+cpt          <- read_tsv("data/phenotype/cpt.tsv",          show_col_types = FALSE)
+cvlt         <- read_tsv("data/phenotype/cvlt.tsv",         show_col_types = FALSE)
+colortrails  <- read_tsv("data/phenotype/colortrails.tsv",  show_col_types = FALSE)
+stopsignal   <- read_tsv("data/phenotype/stopsignal.tsv",   show_col_types = FALSE)
+
+beh <- participants %>%
+  select(participant_id, diagnosis, age, gender) %>%
+  left_join(wais        %>% select(participant_id, wm            = lns_totalraw),  by = "participant_id") %>%
+  left_join(cpt         %>% select(participant_id, attention     = cpt_fa),         by = "participant_id") %>%
+  left_join(cvlt        %>% select(participant_id, verbal_memory = cvlt_totcor),   by = "participant_id") %>%
+  left_join(colortrails %>% select(participant_id, proc_speed    = crt_time1),     by = "participant_id") %>%
+  left_join(stopsignal  %>% select(participant_id, inhibition    = sst_ses_ssrt),  by = "participant_id") %>%
+  mutate(
+    inhibition     = as.numeric(inhibition),
+    participant_id = gsub("sub-", "", participant_id)
+  )
+
+cat("Behavioural data rows:", nrow(beh), "\n")
+cat("Diagnosis breakdown:\n")
+print(table(beh$diagnosis))
+```
+
+## 3.5 Match FC and Behavioural Data
+
+```{r match-data}
+fc_subj_clean <- gsub("sub-", "", rownames(fc_matrix))
+matched_idx   <- match(fc_subj_clean, beh$participant_id)
+valid         <- !is.na(matched_idx)
+
+fc_matched  <- fc_matrix[valid, ]
+beh_matched <- beh[matched_idx[valid], ]
+
+cat("Matched N =", nrow(fc_matched), "\n")
+cat("Diagnosis breakdown (matched):\n")
+print(table(beh_matched$diagnosis))
+```
+
+---
+
+# 4. Residualise Cognitive Scores
+
+Cognitive scores are **residualised against age and gender** using linear regression before CPM. The residuals represent each participant's cognitive performance after removing variance attributable to demographic differences between groups, ensuring CPM captures genuine brain-behaviour relationships rather than demographic confounds.
+
+**Why this matters:** The diagnostic groups in UCLA CNP differ systematically in age and gender composition. Without correction, CPM may predict diagnosis-related demographic variation rather than FC-cognition relationships. Working memory and attention showed apparently significant predictions before covariate correction (r ≈ −0.19, p = 0.003) that disappeared after — confirming these were demographic confounds, not genuine neural signal.
+
+```{r residualise}
+residualise <- function(score, age, gender) {
+  df          <- data.frame(score = score, age = age, gender = gender)
+  df_complete <- df[!is.na(score), ]
+  model       <- lm(score ~ age + gender, data = df_complete)
+  resid_full  <- rep(NA, nrow(df))
+  resid_full[!is.na(score)] <- residuals(model)
+  return(resid_full)
+}
+
+beh_matched <- beh_matched %>%
+  mutate(
+    wm_resid        = residualise(wm,           age, gender),
+    attention_resid = residualise(attention,     age, gender),
+    vm_resid        = residualise(verbal_memory, age, gender),
+    ps_resid        = residualise(proc_speed,    age, gender),
+    inhib_resid     = residualise(inhibition,    age, gender)
+  )
+
+cat("Residualised scores computed\n")
+```
+
+---
+
+# 5. Connectome-Based Predictive Modelling (CPM)
+
+## 5.1 Method Overview
+
+CPM (Shen et al., 2017) predicts individual cognitive scores from whole-brain FC using **leave-one-out cross-validation (LOO-CV)**:
+
+1. **Hold out** one participant as the test case
+2. **Correlate** each of the 3,321 FC edges with the cognitive score across the remaining N−1 training participants
+3. **Select edges** significantly correlated at p < 0.01 — separately for positive edges (higher FC → higher score) and negative edges (higher FC → lower score)
+4. **Compute network strength**: `net_strength = Σ(positive edges) − Σ(negative edges)`
+5. **Fit a linear model**: cognitive score ~ net_strength (training data only)
+6. **Predict** the held-out participant's score using their net_strength
+7. **Repeat** for all N participants; compute **Pearson r** between all predicted and observed scores as the accuracy metric
+
+**Why p < 0.01?** Standard threshold from Shen et al. (2017), balancing edge selection sensitivity against overfitting — too liberal includes noise, too strict leaves too few edges to build a reliable network.
+
+**Why LOO-CV?** With N ≈ 260, LOO-CV maximises training data at each fold and is standard practice for CPM at this sample size.
+
+## 5.2 CPM Function
+
+```{r cpm-function}
+run_cpm <- function(fc_mat, scores, p_thresh = 0.01) {
+
+  valid_idx  <- which(!is.na(scores))
+  fc_use     <- fc_mat[valid_idx, ]
+  scores_use <- scores[valid_idx]
+  N          <- length(scores_use)
+  predicted  <- rep(NA, N)
+
+  for (i in 1:N) {
+    if (i %% 20 == 0) cat("  LOO iteration", i, "/", N, "\n")
+
+    train_fc     <- fc_use[-i, ]
+    train_scores <- scores_use[-i]
+    test_fc      <- fc_use[i, ]
+
+    edge_cors <- apply(train_fc, 2, function(edge) {
+      ct <- cor.test(edge, train_scores, method = "pearson")
+      c(r = ct$estimate, p = ct$p.value)
+    })
+    r_vals <- edge_cors["r.cor", ]
+    p_vals <- edge_cors["p",     ]
+
+    pos_edges <- which(p_vals < p_thresh & r_vals > 0)
+    neg_edges <- which(p_vals < p_thresh & r_vals < 0)
+
+    pos_str_train <- if (length(pos_edges) > 0) rowSums(train_fc[, pos_edges, drop = FALSE]) else rep(0, N - 1)
+    neg_str_train <- if (length(neg_edges) > 0) rowSums(train_fc[, neg_edges, drop = FALSE]) else rep(0, N - 1)
+    net_str_train <- pos_str_train - neg_str_train
+
+    fit <- lm(train_scores ~ net_str_train)
+
+    pos_str_test <- if (length(pos_edges) > 0) sum(test_fc[pos_edges]) else 0
+    neg_str_test <- if (length(neg_edges) > 0) sum(test_fc[neg_edges]) else 0
+    net_str_test <- pos_str_test - neg_str_test
+
+    predicted[i] <- coef(fit)[1] + coef(fit)[2] * net_str_test
+  }
+
+  ct <- cor.test(predicted, scores_use, method = "pearson")
+  cat("  r =", round(ct$estimate, 3), "  p =", round(ct$p.value, 4), "\n\n")
+
+  return(list(
+    predicted = predicted,
+    observed  = scores_use,
+    r         = ct$estimate,
+    p         = ct$p.value,
+    N         = N
+  ))
+}
+```
+
+## 5.3 Run CPM
+
+```{r run-cpm}
+cat("Running CPM (LOO-CV) — this may take 10–15 mins...\n\n")
+
+cognitive_domains <- list(
+  working_memory     = beh_matched$wm_resid,
+  attention          = beh_matched$attention_resid,
+  verbal_memory      = beh_matched$vm_resid,
+  processing_speed   = beh_matched$ps_resid,
+  inhibitory_control = beh_matched$inhib_resid
+)
+
+cpm_results <- list()
+for (domain in names(cognitive_domains)) {
+  cat("Running CPM for:", domain, "\n")
+  cpm_results[[domain]] <- run_cpm(fc_matched, cognitive_domains[[domain]])
+}
+```
+
+---
+
+# 6. Results
+
+```{r results-table}
+results_df <- map_dfr(names(cpm_results), function(domain) {
+  res <- cpm_results[[domain]]
+  tibble(
+    `Cognitive Domain` = domain,
+    N                  = res$N,
+    r                  = round(res$r, 3),
+    p                  = round(res$p, 3),
+    Significant        = ifelse(res$p < 0.05, "✓", "")
+  )
+})
+
+knitr::kable(results_df,
+             caption = "CPM Prediction Accuracy per Cognitive Domain (after age + gender covariate correction)")
+```
+
+**Interpretation:**
+
+- **Verbal memory** (r = 0.149, p = 0.017) and **inhibitory control** (r = 0.139, p = 0.028) are significantly predicted by resting-state FC across all four diagnostic groups. Both survive covariate correction, indicating genuine brain-behaviour relationships rather than demographic confounds.
+
+- **Working memory and attention** were significant before covariate correction (r ≈ −0.19, p = 0.003 each) but lost significance after — their apparent FC-cognition link was driven by age and gender differences between groups, not genuine neural signal.
+
+- **Processing speed** was non-significant before and after correction. Resting-state FC may not capture the neural substrates of processing speed; task-evoked FC during a speed task would be more appropriate.
+
+- The bar chart below uses **|r| (absolute r)** to compare prediction magnitude across domains regardless of scale direction — some tasks score higher = worse (e.g. SSRT, CPT false alarms), making the sign of r task-dependent rather than biologically meaningful. Signed r and p-values are in the table above.
+
+---
+
+# 7. Visualisations
+
+## 7.1 Predicted vs Observed Scatter Plots
+
+Each panel shows CPM-predicted scores (y-axis) against residualised observed scores (x-axis), coloured by diagnosis group. A significant positive trend indicates the model has captured genuine FC-cognition signal beyond what age and gender explain.
+
+```{r scatter-plots, fig.width=14, fig.height=4}
+diag_colors <- c("CONTROL" = "#2196F3", "SCHZ" = "#F44336",
+                 "BIPOLAR" = "#FF9800", "ADHD"  = "#4CAF50")
+
+plot_list <- list()
+for (nm in names(cpm_results)) {
+  res        <- cpm_results[[nm]]
+  valid_rows <- which(!is.na(cognitive_domains[[nm]]))
+  df <- data.frame(
+    observed  = res$observed,
+    predicted = res$predicted,
+    diagnosis = beh_matched$diagnosis[valid_rows]
+  )
+
+  sig_label <- if (res$p < 0.05) "*" else "ns"
+  label     <- paste0("r = ", round(res$r, 3),
+                      "\np = ", format.pval(res$p, digits = 3), " ", sig_label)
+
+  p <- ggplot(df, aes(x = observed, y = predicted, colour = diagnosis)) +
+    geom_point(alpha = 0.7, size = 2) +
+    geom_smooth(method = "lm", colour = "black", se = TRUE, linewidth = 0.8) +
+    scale_colour_manual(values = diag_colors) +
+    annotate("text", x = -Inf, y = Inf, label = label,
+             hjust = -0.1, vjust = 1.5, size = 3, fontface = "italic") +
+    labs(title    = gsub("_", " ", nm),
+         subtitle = ifelse(res$p < 0.05, "Significant (p < .05)", "Non-significant"),
+         x = "Observed (residualised)", y = "Predicted",
+         colour = "Diagnosis") +
+    theme_minimal(base_size = 10) +
+    theme(plot.title    = element_text(hjust = 0.5, face = "bold", size = 10),
+          plot.subtitle = element_text(hjust = 0.5, size = 8,
+                                       colour = ifelse(res$p < 0.05, "#1565C0", "gray50")),
+          legend.position = "bottom",
+          legend.text = element_text(size = 7))
+  plot_list[[nm]] <- p
+}
+
+wrap_plots(plot_list, ncol = 5) +
+  plot_annotation(
+    title    = "CPM: Predicted vs Observed Cognitive Scores",
+    subtitle = "Resting-state FC → Cognitive performance | LOO-CV | Covariate-corrected (age + gender)",
+    theme    = theme(plot.title    = element_text(size = 13, face = "bold", hjust = 0.5),
+                     plot.subtitle = element_text(size = 10, hjust = 0.5, colour = "gray40"))
+  )
+```
+
+## 7.2 CPM Prediction Accuracy Summary
+
+```{r bar-plot, fig.width=7, fig.height=4}
+results_df %>%
+  mutate(
+    domain   = gsub("_", "\n", `Cognitive Domain`),
+    fill_col = ifelse(p < 0.05, "#1565C0", "#AAAAAA"),
+    label    = ifelse(p < 0.05, paste0("r = ", r, "*"), paste0("r = ", r))
+  ) %>%
+  ggplot(aes(x = reorder(domain, abs(r)), y = abs(r), fill = fill_col)) +
+  geom_col(colour = "black", linewidth = 0.3) +
+  geom_text(aes(label = label), hjust = -0.1, size = 3.2) +
+  scale_fill_identity() +
+  coord_flip() +
+  ylim(0, max(abs(results_df$r)) * 1.5) +
+  labs(
+    title    = "CPM Prediction Accuracy by Cognitive Domain",
+    subtitle = "Blue = significant (p < .05)  |  Grey = non-significant  |  Bar length = |r|",
+    x = NULL,
+    y = "|r| (predicted–observed correlation)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title    = element_text(face = "bold", size = 13, hjust = 0.5),
+        plot.subtitle = element_text(size = 10, hjust = 0.5, colour = "gray40"))
+```
+
+## 7.3 Example FC Matrix
+
+This heatmap shows the Pearson correlation matrix for one representative participant (82 × 82 regions). Raw Pearson r is used here — not Fisher-Z — since corrplot requires values in [−1, 1]. Blue = positive FC (co-activation), red = negative FC (anti-correlation). The diagonal is 1 by definition. The visible block structure reflects known resting-state network organisation: regions within the same functional network show stronger mutual correlations.
+
+```{r fc-matrix, fig.width=6, fig.height=5.5}
+example_fc <- cor(t(ts_list[[1]]), method = "pearson")
+rownames(example_fc) <- unique_regions
+colnames(example_fc) <- unique_regions
+
+corrplot(example_fc,
+         method = "color",
+         type   = "full",
+         tl.pos = "n",
+         cl.cex = 0.7,
+         col    = colorRampPalette(c("#D6604D", "white", "#2166AC"))(200),
+         title  = "Example FC Matrix — Subject 1 (82 × 82 regions)",
+         mar    = c(0, 0, 2, 0))
+```
+
+---
+
+# 8. Save Results
+
+```{r save-results}
+# CPM summary table
+write.csv(results_df, "CPM_summary.csv", row.names = FALSE)
+
+# Scatter plots
+scatter_save <- {
+  pl <- list()
+  for (nm in names(cpm_results)) {
+    res        <- cpm_results[[nm]]
+    valid_rows <- which(!is.na(cognitive_domains[[nm]]))
+    df <- data.frame(observed  = res$observed, predicted = res$predicted,
+                     diagnosis = beh_matched$diagnosis[valid_rows])
+    label <- paste0("r = ", round(res$r, 3), ", p = ", round(res$p, 3))
+    pl[[nm]] <- ggplot(df, aes(x = observed, y = predicted, colour = diagnosis)) +
+      geom_point(alpha = 0.6, size = 1.8) +
+      geom_smooth(method = "lm", colour = "black", se = TRUE, linewidth = 0.8) +
+      scale_colour_manual(values = diag_colors) +
+      annotate("text", x = -Inf, y = Inf, label = label,
+               hjust = -0.1, vjust = 1.5, size = 2.8, fontface = "italic") +
+      labs(title = gsub("_", " ", nm), x = "Observed", y = "Predicted", colour = "Diagnosis") +
+      theme_minimal(base_size = 9) +
+      theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 9),
+            legend.position = "bottom", legend.text = element_text(size = 7))
+  }
+  wrap_plots(pl, ncol = 5)
+}
+ggsave("CPM_scatter_plots.png", scatter_save, width = 16, height = 4, dpi = 150)
+
+# Bar plot
+bar_save <- results_df %>%
+  mutate(domain   = gsub("_", "\n", `Cognitive Domain`),
+         fill_col = ifelse(p < 0.05, "#1565C0", "#AAAAAA"),
+         label    = ifelse(p < 0.05, paste0("r=", r, "*"), paste0("r=", r))) %>%
+  ggplot(aes(x = reorder(domain, abs(r)), y = abs(r), fill = fill_col)) +
+  geom_col(colour = "black", linewidth = 0.3) +
+  geom_text(aes(label = label), hjust = -0.1, size = 3.2) +
+  scale_fill_identity() + coord_flip() +
+  ylim(0, max(abs(results_df$r)) * 1.5) +
+  labs(title = "CPM Prediction Accuracy", subtitle = "Blue = p < .05",
+       x = NULL, y = "|r|") +
+  theme_minimal(base_size = 11)
+ggsave("CPM_bar_plot.png", bar_save, width = 7, height = 4, dpi = 150)
+
+cat("Saved:\n  CPM_summary.csv\n  CPM_scatter_plots.png\n  CPM_bar_plot.png\n")
+```
+
+---
+
+# 9. Session Info
+
+```{r session-info}
+sessionInfo()
+```
+
+---
+
+# References
+
+- Bryant, A. G., Aquino, K., Parkes, L., Fornito, A., & Fulcher, B. D. (2023). Data files to support "Extracting interpretable signatures of whole-brain dynamics through systematic comparison". *Zenodo*. https://doi.org/10.5281/zenodo.10431855
+
+- Poldrack, R. A., et al. (2016). A phenome-wide examination of neural and cognitive function. *Scientific Data*, 3, 160110. https://doi.org/10.1038/sdata.2016.110
+
+- Shen, X., et al. (2017). Using connectome-based predictive modeling to predict individual behavior from brain connectivity. *Nature Protocols*, 12, 506–518. https://doi.org/10.1038/nprot.2016.178
+
+- Vöhringer, P. A., et al. (2013). Cognitive impairment in bipolar disorder and schizophrenia. *Journal of Psychiatric Research*, 47, 166–172.
